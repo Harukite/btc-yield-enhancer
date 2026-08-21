@@ -26,11 +26,13 @@ from typing import Optional
 
 from okx_api import OKXClient
 from okx_ws import OKXWSClient
+from runtime_paths import get_runtime_paths
 
 logger = logging.getLogger(__name__)
 
 BJT = timezone(timedelta(hours=8))
-STATE_FILE = os.path.join(os.path.dirname(__file__), "state.json")
+RUNTIME_PATHS = get_runtime_paths()
+STATE_FILE = RUNTIME_PATHS.state_file
 
 DEFAULT_CONFIG = {
     "trade_size_usdc": 100.0,
@@ -125,7 +127,7 @@ class StrategyEngine:
     # ------------------------------------------------------------------
 
     STATE_BACKUP_DAYS = 7
-    _state_backup_dir = os.path.join(os.path.dirname(STATE_FILE), "state_backups")
+    _state_backup_dir = RUNTIME_PATHS.state_backup_dir
 
     def _save_state(self):
         """保存锚点、初始值、交易记录、运行时配置到文件，重启时恢复
@@ -150,6 +152,7 @@ class StrategyEngine:
             }
             # 原子写入
             import tempfile
+            os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
             tmp = tempfile.NamedTemporaryFile(
                 mode="w", dir=os.path.dirname(STATE_FILE),
                 delete=False, suffix=".tmp",

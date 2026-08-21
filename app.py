@@ -19,6 +19,10 @@ from flask_sock import Sock
 
 from strategy_engine import StrategyEngine
 from okx_api import OKXClient
+from runtime_paths import get_runtime_paths
+
+
+RUNTIME_PATHS = get_runtime_paths()
 
 
 def _setup_logging():
@@ -27,7 +31,7 @@ def _setup_logging():
     pythonw 下 stdout 被重定向到 os.devnull, 控制台 handler 无效但无害；
     关键是所有模块日志都通过 root logger 写入 btc.log, 解决可观测性缺口。
     """
-    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+    log_dir = RUNTIME_PATHS.log_dir
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, "btc.log")
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -49,7 +53,7 @@ def _setup_logging():
 _setup_logging()
 logger = logging.getLogger(__name__)
 
-ENV_FILE = os.path.join(os.path.dirname(__file__), ".env")
+ENV_FILE = RUNTIME_PATHS.env_file
 
 
 def _load_env_file():
@@ -69,6 +73,7 @@ _load_env_file()
 def _save_env(api_key, api_secret, passphrase):
     """将 OKX 凭证写回 .env 文件，保证重启后不丢失（原子写入，防写一半崩溃损坏）"""
     try:
+        os.makedirs(os.path.dirname(ENV_FILE), exist_ok=True)
         lines = []
         if os.path.exists(ENV_FILE):
             with open(ENV_FILE, "r", encoding="utf-8") as f:

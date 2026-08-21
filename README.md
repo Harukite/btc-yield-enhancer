@@ -117,6 +117,7 @@ OKX_API_SECRET=your_api_secret_here
 OKX_PASSPHRASE=your_passphrase_here
 OKX_TESTNET=1
 OKX_INSTRUMENT_NAME=BTC-USDC
+DATA_DIR=/data
 ```
 
 For US/AU or EEA accounts, set the matching OKX regional endpoints with `OKX_REST_BASE_URL`, `OKX_WS_PUBLIC_URL`, and `OKX_WS_PRIVATE_URL`.
@@ -244,13 +245,14 @@ OKX_API_SECRET=your_api_secret_here
 OKX_PASSPHRASE=your_passphrase_here
 OKX_TESTNET=1
 OKX_INSTRUMENT_NAME=BTC-USDC
+DATA_DIR=/data
 API_TOKEN=replace_with_a_long_random_value
 OKX_REST_BASE_URL=https://openapi.okx.com
 NIXPACKS_INSTALL_CMD=pip install -r requirements.txt gunicorn
 NIXPACKS_START_CMD=gunicorn --bind 0.0.0.0:5050 --workers 1 --threads 8 --timeout 120 app:app
 ```
 
-Expose target port `5050`. Put the dashboard behind Basic Auth, Cloudflare Access, Tailscale, or another access control layer before using real funds.
+Expose target port `5050`. Add a Dokploy volume mounted at `/data` so `state.json`, `state_backups/`, `logs/`, and dashboard-saved `.env` survive redeploys. Put the dashboard behind Basic Auth, Cloudflare Access, Tailscale, or another access control layer before using real funds.
 
 ---
 
@@ -258,12 +260,12 @@ Expose target port `5050`. Put the dashboard behind Basic Auth, Cloudflare Acces
 
 ### State Persistence / 状态持久化
 
-The strategy saves its state to `state.json` on every trade and on stop. On restart, it:
+The strategy saves its state to `state.json` on every trade and on stop. Set `DATA_DIR=/data` in production and mount `/data` as persistent storage. On restart, it:
 - Restores the anchor price (if within 10% of current index price)
 - Restores historical trades and total trade count
 - Auto-resumes trading if it was running before the restart
 
-策略每次成交和停止时保存 state.json。重启时自动恢复锚点（偏差 10% 内）、历史成交记录，若之前交易已启动则自动恢复交易。
+策略每次成交和停止时保存 state.json。生产部署建议设置 `DATA_DIR=/data` 并把 `/data` 挂成持久卷。重启时自动恢复锚点（偏差 10% 内）、历史成交记录，若之前交易已启动则自动恢复交易。
 
 ### Updating / 升级
 
