@@ -57,6 +57,11 @@ class OKXWSClient:
         self.testnet = testnet
         self.instrument_name = instrument_name or os.environ.get("OKX_INSTRUMENT_NAME", "BTC-USDC")
         self.base_currency, self.quote_currency = self._split_instrument(self.instrument_name)
+        self.index_instrument_name = os.environ.get("OKX_WS_INDEX_INSTRUMENT_NAME")
+        if not self.index_instrument_name:
+            self.index_instrument_name = self.instrument_name
+            if self.testnet and self.quote_currency == "USDC":
+                self.index_instrument_name = f"{self.base_currency}-USDT"
         self._user_callback = callback
 
         self.ws_public_url = (
@@ -234,12 +239,12 @@ class OKXWSClient:
 
     async def _subscribe_public(self, ws):
         msg = {
-            "id": "index-ticker",
+            "id": "indexticker",
             "op": "subscribe",
-            "args": [{"channel": "index-tickers", "instId": self.instrument_name}],
+            "args": [{"channel": "index-tickers", "instId": self.index_instrument_name}],
         }
         await ws.send(json.dumps(msg))
-        logger.info("OKX WS index ticker subscribed: %s", self.instrument_name)
+        logger.info("OKX WS index ticker subscribed: %s", self.index_instrument_name)
 
     async def _login_private(self, ws):
         timestamp = str(int(time.time()))
@@ -409,4 +414,5 @@ class OKXWSClient:
             "cached_usdc_available": self.cached_usdc_available,
             "cached_btc_available": self.cached_btc_available,
             "cached_index_price": self.cached_index_price,
+            "index_instrument_name": self.index_instrument_name,
         }

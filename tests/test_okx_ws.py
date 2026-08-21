@@ -33,6 +33,42 @@ class OKXWSClientTests(unittest.TestCase):
             "data": {"index_price": 64250.5, "idx": 64250.5},
         }])
 
+    def test_public_subscription_uses_alphanumeric_request_id(self):
+        class FakeWebSocket:
+            def __init__(self):
+                self.messages = []
+
+            async def send(self, message):
+                self.messages.append(json.loads(message))
+
+        client = OKXWSClient("key", "secret", "passphrase", instrument_name="BTC-USDC")
+        websocket = FakeWebSocket()
+
+        asyncio.run(client._subscribe_public(websocket))
+
+        self.assertRegex(websocket.messages[0]["id"], r"^[A-Za-z0-9]+$")
+
+    def test_demo_public_subscription_uses_available_usdt_index(self):
+        class FakeWebSocket:
+            def __init__(self):
+                self.messages = []
+
+            async def send(self, message):
+                self.messages.append(json.loads(message))
+
+        client = OKXWSClient(
+            "key", "secret", "passphrase",
+            testnet=True,
+            instrument_name="BTC-USDC",
+        )
+        websocket = FakeWebSocket()
+
+        asyncio.run(client._subscribe_public(websocket))
+
+        self.assertEqual(
+            websocket.messages[0]["args"][0]["instId"], "BTC-USDT",
+        )
+
     def test_account_message_emits_existing_portfolio_channel_shape(self):
         messages = []
         client = OKXWSClient("key", "secret", "passphrase", instrument_name="BTC-USDC", callback=messages.append)
