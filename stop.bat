@@ -22,7 +22,7 @@ goto :kill
 
 :found
 echo [1/3] 通知策略停止...
-"%PYTHON%" -c "import urllib.request; print(urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:5050/api/stop', method='POST'), timeout=5).read().decode())" 2>nul || echo 服务未运行
+"%PYTHON%" -c "import urllib.request; print(urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:5050/btc-enhancer/api/stop', method='POST'), timeout=5).read().decode())" 2>nul || echo 服务未运行
 
 :kill
 echo [2/3] 清理端口进程...

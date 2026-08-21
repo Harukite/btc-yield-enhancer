@@ -114,7 +114,7 @@
     setStatus(data.status);
     $("lastUpdate").textContent = data.last_update ? data.last_update.split(".")[0].replace("T", " ") : "等待数据...";
 
-    var extra = "BTC/USDC · WS";
+    var extra = ((data.config && data.config.instrument_name) || "BTC-USDC").replace("-", "/") + " · OKX WS";
     if (data.config && data.config.testnet) extra += " · TESTNET";
     $("topbarExtra").textContent = extra;
 
@@ -330,18 +330,20 @@
     $("btnSaveCreds").addEventListener("click", async function () {
       var apiId = $("inpApiId").value.trim();
       var apiSecret = $("inpApiSecret").value.trim();
-      if (!apiId || !apiSecret) { alert("请输入完整的 Client ID 和 Secret"); return; }
+      var passphrase = $("inpPassphrase").value.trim();
+      if (!apiId || !apiSecret || !passphrase) { alert("请输入完整的 API Key、Secret 和 Passphrase"); return; }
       if (!confirm("⚠ 修改凭证将断开当前连接并重新初始化，确定继续？")) return;
       try {
         var resp = await fetch("/btc-enhancer/api/credentials", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ client_id: apiId, client_secret: apiSecret }),
+          body: JSON.stringify({ client_id: apiId, client_secret: apiSecret, passphrase: passphrase }),
         });
         var result = await resp.json();
         if (result.success) {
           alert("✅ " + result.message);
           $("inpApiSecret").value = "";  // 清空密码框
+          $("inpPassphrase").value = "";
           // 重新获取脱敏后的凭证
           var r = await (await fetch("/btc-enhancer/api/credentials")).json();
           $("inpApiId").value = r.client_id_masked || "";

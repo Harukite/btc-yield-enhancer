@@ -24,8 +24,8 @@ from datetime import datetime, timezone, timedelta
 from statistics import stdev
 from typing import Optional
 
-from deribit_api import DeribitClient
-from deribit_ws import DeribitWSClient
+from okx_api import OKXClient
+from okx_ws import OKXWSClient
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +40,8 @@ DEFAULT_CONFIG = {
     "poll_interval": 30,
     "cooldown_seconds": 180,
     "stale_threshold": 0.5,          # 挂单偏移撤单阈值（USDC）
-    "instrument_name": "BTC_USDC",
-    "index_name": "btc_usdc",
+    "instrument_name": "BTC-USDC",
+    "index_name": "BTC-USDC",
     "min_poll_balance_usdc": 200,   # 资金保护阈值 $200
 }
 
@@ -49,10 +49,16 @@ DEFAULT_CONFIG = {
 class StrategyEngine:
     """策略引擎 - 在后台线程运行"""
 
-    def __init__(self, client_id, client_secret, config=None, testnet=False, state_callback=None):
-        self.api = DeribitClient(client_id, client_secret, testnet=testnet)
-        self.testnet = testnet
+    def __init__(self, api_key, api_secret, passphrase="", config=None, testnet=False, state_callback=None):
         self.cfg = {**DEFAULT_CONFIG, **(config or {})}
+        self.api = OKXClient(
+            api_key,
+            api_secret,
+            passphrase,
+            testnet=testnet,
+            instrument_name=self.cfg["instrument_name"],
+        )
+        self.testnet = testnet
         # 从 state.json 恢复运行时修改的配置（只恢复用户可调的键，不覆盖新默认值）
         _saved = self._load_state()
         if _saved and isinstance(_saved.get("config"), dict):
@@ -106,7 +112,7 @@ class StrategyEngine:
         self._our_sell_id: Optional[str] = None  # 我们挂的卖出单 ID
 
         # WebSocket 客户端（实时数据源）
-        self._ws: Optional[DeribitWSClient] = None
+        self._ws: Optional[OKXWSClient] = None
         self._ws_enabled = False
         self._last_ws_index_update = 0.0  # 最新一次从 WS 拿到指数价的时间戳
         self._last_ws_balance_update = 0.0  # 最新一次从 WS 拿到余额的时间戳
@@ -226,7 +232,8 @@ class StrategyEngine:
 
     def _fetch_instrument_info(self):
         try:
-            instruments = self.api.get_instruments(currency="BTC", kind="spot")
+            base_currency = self.cfg["instrument_name"].replace("_", "-").split("-")[0]
+            instruments = self.api.get_instruments(currency=base_currency, kind="spot")
             for inst in instruments:
                 if inst["instrument_name"] == self.cfg["instrument_name"]:
                     self.contract_size = float(inst.get("contract_size", 0.0001))
@@ -254,9 +261,10 @@ class StrategyEngine:
             pass
         # 启动 WebSocket 客户端（后台线程）
         try:
-            self._ws = DeribitWSClient(
-                self.api.client_id, self.api.client_secret,
+            self._ws = OKXWSClient(
+                self.api.api_key, self.api.api_secret, self.api.passphrase,
                 testnet=self.testnet,
+                instrument_name=self.cfg["instrument_name"],
                 callback=self._on_ws_message,
             )
             self._ws.start()
@@ -579,10 +587,10 @@ class StrategyEngine:
             logger.info("RV: %.2f%% → %.2f%%", old * 100, rv * 100)
 
     def _calculate_daily_rv(self):
-        """用主网 BTC_USDC 现货 5 分钟 K 线，取 12 根(1小时窗口)的 RMS × √24 作为日化 RV"""
+        """用当前现货标的 5 分钟 K 线，取 12 根(1小时窗口)的 RMS × √24 作为日化 RV"""
         end = int(time.time() * 1000)
         start = end - 3 * 3600 * 1000  # 拉3小时确保有12根
-        data = self._fetch_public_kline("BTC_USDC", start, end, "5")
+        data = self.api.get_tradingview_chart_data(self.cfg["instrument_name"], start, end, "5")
         if not data or not data.get("close") or not data.get("open"):
             return self._fallback_rv()
 
@@ -612,30 +620,6 @@ class StrategyEngine:
 
     def _fallback_rv(self):
         return self.cfg["rv_min"]
-
-    @staticmethod
-    def _fetch_public_kline(instrument, start_ms, end_ms, resolution):
-        """通过主网公共 API 获取 K 线数据（无需鉴权，不受 testnet 影响）"""
-        try:
-            import requests
-            payload = {
-                "jsonrpc": "2.0", "id": 1,
-                "method": "public/get_tradingview_chart_data",
-                "params": {
-                    "instrument_name": instrument,
-                    "start_timestamp": int(start_ms),
-                    "end_timestamp": int(end_ms),
-                    "resolution": resolution,
-                },
-            }
-            resp = requests.post(
-                "https://www.deribit.com/api/v2/", json=payload, timeout=15
-            )
-            data = resp.json()
-            return data.get("result")
-        except Exception as e:
-            logger.warning("Fetch public kline failed: %s", e)
-            return None
 
     # ------------------------------------------------------------------
     # WebSocket 回调（由 WS 线程调用）
@@ -730,12 +714,13 @@ class StrategyEngine:
             # WS 余额疑似过期，fall through 到 REST 兜底
         # WS 不可用，REST fallback
         try:
-            usdc = self.api.get_account_summary(currency="USDC")
-            if usdc:
-                self.usdc_balance = float(usdc.get("balance", 0))
-            btc = self.api.get_account_summary(currency="BTC")
-            if btc:
-                self.btc_balance = float(btc.get("balance", 0))
+            base_currency, quote_currency = self.cfg["instrument_name"].replace("_", "-").split("-")[:2]
+            quote = self.api.get_account_summary(currency=quote_currency)
+            if quote:
+                self.usdc_balance = float(quote.get("balance", 0))
+            base = self.api.get_account_summary(currency=base_currency)
+            if base:
+                self.btc_balance = float(base.get("balance", 0))
             return {"usdc_balance": self.usdc_balance, "btc_balance": self.btc_balance}
         except Exception as e:
             logger.error("Fetch balances (REST fallback): %s", e)
@@ -848,13 +833,13 @@ class StrategyEngine:
                     setattr(self, our_attr, existing)
                     self._log_info("Reclaimed %s order %s at price %d", side, existing, target_price)
 
-        # --- 检测成交：订单消失后查 Deribit 订单状态判断是否真成交 ---
+        # --- 检测成交：订单消失后查交易所订单状态判断是否真成交 ---
         # Bugfix v1.9: 不再依赖余额变化（期权估值会污染 BTC balance），
         # 改为直接查询 get_order_state 的 order_state 字段。
         for side_key, our_id_attr in [("sell", "_our_sell_id"), ("buy", "_our_buy_id")]:
             our_id = getattr(self, our_id_attr)
             if our_id and our_id not in current_ids:
-                # 查 Deribit 订单状态确认是否成交
+                # 查交易所订单状态确认是否成交
                 is_filled = False
                 try:
                     order_result = self.api.get_order_state(our_id)

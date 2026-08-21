@@ -18,7 +18,7 @@ from flask import Flask, jsonify, request, make_response
 from flask_sock import Sock
 
 from strategy_engine import StrategyEngine
-from deribit_api import DeribitClient
+from okx_api import OKXClient
 
 
 def _setup_logging():
@@ -66,25 +66,30 @@ def _load_env_file():
 _load_env_file()
 
 
-def _save_env(client_id, client_secret):
-    """将 Deribit 凭证写回 .env 文件，保证重启后不丢失（原子写入，防写一半崩溃损坏）"""
+def _save_env(api_key, api_secret, passphrase):
+    """将 OKX 凭证写回 .env 文件，保证重启后不丢失（原子写入，防写一半崩溃损坏）"""
     try:
         lines = []
         if os.path.exists(ENV_FILE):
             with open(ENV_FILE, "r", encoding="utf-8") as f:
                 lines = f.readlines()
-        found_id = found_secret = False
+        found_key = found_secret = found_passphrase = False
         for i, line in enumerate(lines):
-            if line.startswith("DERIBIT_ID="):
-                lines[i] = f"DERIBIT_ID={client_id}\n"
-                found_id = True
-            elif line.startswith("DERIBIT_SECRET="):
-                lines[i] = f"DERIBIT_SECRET={client_secret}\n"
+            if line.startswith("OKX_API_KEY="):
+                lines[i] = f"OKX_API_KEY={api_key}\n"
+                found_key = True
+            elif line.startswith("OKX_API_SECRET="):
+                lines[i] = f"OKX_API_SECRET={api_secret}\n"
                 found_secret = True
-        if not found_id:
-            lines.append(f"DERIBIT_ID={client_id}\n")
+            elif line.startswith("OKX_PASSPHRASE="):
+                lines[i] = f"OKX_PASSPHRASE={passphrase}\n"
+                found_passphrase = True
+        if not found_key:
+            lines.append(f"OKX_API_KEY={api_key}\n")
         if not found_secret:
-            lines.append(f"DERIBIT_SECRET={client_secret}\n")
+            lines.append(f"OKX_API_SECRET={api_secret}\n")
+        if not found_passphrase:
+            lines.append(f"OKX_PASSPHRASE={passphrase}\n")
         import tempfile
         tmp = tempfile.NamedTemporaryFile(
             mode="w", dir=os.path.dirname(ENV_FILE), delete=False,
@@ -109,18 +114,20 @@ def _save_env(client_id, client_secret):
 # ---------------------------------------------------------------------------
 # API 密钥从环境变量读取（不写入代码明文）
 # ---------------------------------------------------------------------------
-DERIBIT_CLIENT_ID = os.environ.get("DERIBIT_ID", "")
-DERIBIT_CLIENT_SECRET = os.environ.get("DERIBIT_SECRET", "")
-USE_TESTNET = os.environ.get("DERIBIT_TESTNET", "1") == "1"
+OKX_API_KEY = os.environ.get("OKX_API_KEY", "")
+OKX_API_SECRET = os.environ.get("OKX_API_SECRET", "")
+OKX_PASSPHRASE = os.environ.get("OKX_PASSPHRASE", "")
+OKX_INSTRUMENT_NAME = os.environ.get("OKX_INSTRUMENT_NAME", "BTC-USDC")
+USE_TESTNET = os.environ.get("OKX_TESTNET", "1") == "1"
 
 # 可选 API 访问令牌：设置环境变量 API_TOKEN 后，所有写操作(POST)需带 X-API-Token 头
 API_TOKEN = os.environ.get("API_TOKEN", "").strip()
 
-if not DERIBIT_CLIENT_ID or not DERIBIT_CLIENT_SECRET:
+if not OKX_API_KEY or not OKX_API_SECRET or not OKX_PASSPHRASE:
     raise RuntimeError(
-        "请设置环境变量 DERIBIT_ID 和 DERIBIT_SECRET\n"
-        "Linux/Mac: export DERIBIT_ID=xxx && export DERIBIT_SECRET=xxx\n"
-        "Windows:   set DERIBIT_ID=xxx && set DERIBIT_SECRET=xxx\n"
+        "请设置环境变量 OKX_API_KEY、OKX_API_SECRET 和 OKX_PASSPHRASE\n"
+        "Linux/Mac: export OKX_API_KEY=xxx && export OKX_API_SECRET=xxx && export OKX_PASSPHRASE=xxx\n"
+        "Windows:   set OKX_API_KEY=xxx && set OKX_API_SECRET=xxx && set OKX_PASSPHRASE=xxx\n"
         "或在项目根目录创建 .env 文件"
     )
 
@@ -259,7 +266,8 @@ def api_init():
         body = request.get_json(silent=True) or {}
         use_testnet = body.get("testnet", USE_TESTNET)
         engine = StrategyEngine(
-            DERIBIT_CLIENT_ID, DERIBIT_CLIENT_SECRET,
+            OKX_API_KEY, OKX_API_SECRET, OKX_PASSPHRASE,
+            config={"instrument_name": OKX_INSTRUMENT_NAME, "index_name": OKX_INSTRUMENT_NAME},
             testnet=use_testnet,
             state_callback=on_state_update,
         )
@@ -289,7 +297,8 @@ def api_start():
             else:
                 old_anchor = None
             engine = StrategyEngine(
-                DERIBIT_CLIENT_ID, DERIBIT_CLIENT_SECRET,
+                OKX_API_KEY, OKX_API_SECRET, OKX_PASSPHRASE,
+                config={"instrument_name": OKX_INSTRUMENT_NAME, "index_name": OKX_INSTRUMENT_NAME},
                 testnet=USE_TESTNET,
                 state_callback=on_state_update,
             )
@@ -320,13 +329,15 @@ def api_stop():
 @app.route("/btc-enhancer/api/credentials", methods=["GET", "POST"])
 def api_credentials():
     """GET: 返回当前 API 凭证（ID 脱敏）；POST: 更新凭证并重建连接"""
-    global DERIBIT_CLIENT_ID, DERIBIT_CLIENT_SECRET, engine
+    global OKX_API_KEY, OKX_API_SECRET, OKX_PASSPHRASE, engine
 
     if request.method == "GET":
-        masked = DERIBIT_CLIENT_ID[:4] + "****" if len(DERIBIT_CLIENT_ID) > 4 else "****"
+        masked = OKX_API_KEY[:4] + "****" if len(OKX_API_KEY) > 4 else "****"
         return jsonify({
             "client_id_masked": masked,
             "testnet": USE_TESTNET,
+            "exchange": "okx",
+            "instrument_name": OKX_INSTRUMENT_NAME,
         })
 
     # POST — 更新凭证，停旧引擎，重建连接
@@ -339,24 +350,27 @@ def api_credentials():
 
     new_id = data.get("client_id", "").strip()
     new_secret = data.get("client_secret", "").strip()
+    new_passphrase = data.get("passphrase", "").strip()
 
-    if not new_id or not new_secret:
-        return jsonify({"success": False, "message": "ID 和 Secret 不能为空"}), 400
+    if not new_id or not new_secret or not new_passphrase:
+        return jsonify({"success": False, "message": "API Key、Secret 和 Passphrase 不能为空"}), 400
 
     with engine_lock:
         if engine:
             engine.stop()
             engine = None
 
-        DERIBIT_CLIENT_ID = new_id
-        DERIBIT_CLIENT_SECRET = new_secret
+        OKX_API_KEY = new_id
+        OKX_API_SECRET = new_secret
+        OKX_PASSPHRASE = new_passphrase
 
         # 写回 .env 文件，保证重启后不丢失
-        _save_env(new_id, new_secret)
+        _save_env(new_id, new_secret, new_passphrase)
 
         logger.info("API credentials updated, reinitializing...")
         engine = StrategyEngine(
-            DERIBIT_CLIENT_ID, DERIBIT_CLIENT_SECRET,
+            OKX_API_KEY, OKX_API_SECRET, OKX_PASSPHRASE,
+            config={"instrument_name": OKX_INSTRUMENT_NAME, "index_name": OKX_INSTRUMENT_NAME},
             testnet=USE_TESTNET,
             state_callback=on_state_update,
         )
@@ -445,26 +459,17 @@ def api_params():
 
 @app.route("/btc-enhancer/api/kline")
 def api_kline():
-    """拉主网 BTC_USDC 现货 K 线（公共 API，无需鉴权，不受 testnet 开关影响）"""
+    """拉 OKX 当前现货标的 K 线"""
     try:
-        import requests as _requests
         end = int(pytime.time() * 1000)
         start = end - 7 * 86400 * 1000
-        payload = {
-            "jsonrpc": "2.0", "id": 1,
-            "method": "public/get_tradingview_chart_data",
-            "params": {
-                "instrument_name": "BTC_USDC",
-                "start_timestamp": start,
-                "end_timestamp": end,
-                "resolution": "5",
-            },
-        }
-        resp = _requests.post(
-            "https://www.deribit.com/api/v2/", json=payload, timeout=15
+        client = OKXClient(
+            OKX_API_KEY, OKX_API_SECRET, OKX_PASSPHRASE,
+            testnet=USE_TESTNET,
+            instrument_name=OKX_INSTRUMENT_NAME,
         )
-        data = resp.json()
-        return jsonify(data.get("result") or {"error": "no data"})
+        data = client.get_tradingview_chart_data(OKX_INSTRUMENT_NAME, start, end, "5")
+        return jsonify(data or {"error": "no data"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -473,15 +478,20 @@ def api_kline():
 def api_test_connection():
     results = {}
     for label, testnet in [("mainnet", False), ("testnet", True)]:
-        client = DeribitClient(DERIBIT_CLIENT_ID, DERIBIT_CLIENT_SECRET, testnet=testnet)
+        client = OKXClient(
+            OKX_API_KEY, OKX_API_SECRET, OKX_PASSPHRASE,
+            testnet=testnet,
+            instrument_name=OKX_INSTRUMENT_NAME,
+        )
         info = client.check_connection()
         if info["connected"]:
-            price = client.get_index_price("btc_usdc")
+            price = client.get_index_price(OKX_INSTRUMENT_NAME)
             info["btc_index_price"] = price
             try:
-                usdc = client.get_account_summary(currency="USDC")
-                if usdc:
-                    info["usdc_balance"] = usdc.get("balance", 0)
+                quote_currency = OKX_INSTRUMENT_NAME.replace("_", "-").split("-")[1]
+                quote = client.get_account_summary(currency=quote_currency)
+                if quote:
+                    info["usdc_balance"] = quote.get("balance", 0)
             except Exception:
                 pass
             try:
@@ -513,7 +523,12 @@ def api_config():
     with engine_lock:
         if engine is None:
             use_testnet = data.get("testnet", USE_TESTNET)
-            engine = StrategyEngine(DERIBIT_CLIENT_ID, DERIBIT_CLIENT_SECRET, testnet=use_testnet, state_callback=on_state_update)
+            engine = StrategyEngine(
+                OKX_API_KEY, OKX_API_SECRET, OKX_PASSPHRASE,
+                config={"instrument_name": OKX_INSTRUMENT_NAME, "index_name": OKX_INSTRUMENT_NAME},
+                testnet=use_testnet,
+                state_callback=on_state_update,
+            )
         # 整数型参数（带范围校验）
         for key, (lo, hi) in {"poll_interval": (5, 300), "cooldown_seconds": (10, 600),
                                "rv_update_interval_minutes": (5, 1440)}.items():
@@ -538,8 +553,9 @@ def api_config():
                 except (TypeError, ValueError):
                     pass
         # 标的（仅未运行时可改，限定取值）
-        if "instrument_name" in data and data["instrument_name"] in ("BTC_USDC", "ETH_USDC"):
+        if "instrument_name" in data and data["instrument_name"] in ("BTC-USDC", "BTC-USDT"):
             engine.cfg["instrument_name"] = data["instrument_name"]
+            engine.cfg["index_name"] = data["instrument_name"]
             changed.append(f"instrument_name={data['instrument_name']}")
     return jsonify({"success": True, "changed": changed})
 

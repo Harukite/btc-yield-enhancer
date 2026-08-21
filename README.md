@@ -1,8 +1,8 @@
 # ⚡ BTC Yield Enhancer / BTC 收益增强策略
 
-> A Deribit spot maker grid strategy that automatically trades BTC/USDC around an anchor price, profiting from market volatility.
+> An OKX spot maker grid strategy that automatically trades BTC/USDC around an anchor price, profiting from market volatility.
 >
-> 一个在 Deribit 上运行 BTC/USDC 现货 maker 网格的策略，围绕价格锚点自动低买高卖，从市场波动中获利。
+> 一个在 OKX 上运行 BTC/USDC 现货 maker 网格的策略，围绕价格锚点自动低买高卖，从市场波动中获利。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/Python-3.10+-blue)
@@ -27,7 +27,7 @@
 
 ### Core Logic / 核心逻辑
 
-The strategy maintains a **maker grid** on Deribit's BTC/USDC spot market:
+The strategy maintains a **maker grid** on OKX's BTC/USDC spot market:
 
 1. **Anchor Price** – On startup, the current index price is recorded as the anchor.
 2. **Daily RV (Realized Volatility)** – Calculated from 12 × 5-minute candles (1-hour window), RMS scaled by √24 to daily. Clamped between 0.5%–5.0%. Updated after each trade and every 15 minutes as a fallback.
@@ -42,7 +42,7 @@ The strategy maintains a **maker grid** on Deribit's BTC/USDC spot market:
    - **Plan A**: if the fill price deviates from the current index price by more than RV, the anchor chases the index price and re-enters.
 6. **Independent Directional Protection** – When USDC balance drops below the threshold ($200), buying pauses. When BTC value drops below $200, selling pauses. Each recovers automatically.
 
-策略在 Deribit BTC/USDC 现货市场运行一个 **maker 网格**：
+策略在 OKX BTC/USDC 现货市场运行一个 **maker 网格**：
 
 1. **价格锚点** – 启动时以当前指数价为锚点
 2. **日化 RV（已实现波动率）** – 取 12 根 5 分钟 K 线的 RMS 乘以 √24，限幅 0.5%–5.0%，成交后实时更新 + 15 分钟兜底更新
@@ -80,12 +80,10 @@ Buy  @ $63,700 ← maker buy placed here
 ### Prerequisites / 前置条件
 
 - **Python 3.10+**
-- **A Deribit account** with API credentials (mainnet or testnet)
-  - [Deribit Testnet](https://test.deribit.com/) (recommended for first try)
-  - [Deribit Mainnet](https://www.deribit.com/)
+- **An OKX account** with API credentials (mainnet or demo trading)
 - API Key permissions required: `Trade`, `Read`
 
-需要：Python 3.10+、Deribit 账户和 API 密钥（建议先从 Testnet 开始），API 密钥需要 `Trade` + `Read` 权限。
+需要：Python 3.10+、OKX 账户和 API Key（建议先用 Demo Trading），API Key 需要 `Trade` + `Read` 权限。
 
 ### Installation / 安装
 
@@ -110,14 +108,18 @@ cp .env.example .env
 
 ### Configuration / 配置
 
-Edit the `.env` file with your Deribit API credentials:
+Edit the `.env` file with your OKX API credentials:
 
 ```bash
 # .env — never commit this file!
-DERIBIT_ID=your_client_id_here
-DERIBIT_SECRET=your_client_secret_here
-DERIBIT_TESTNET=1   # 1 = testnet, 0 = mainnet
+OKX_API_KEY=your_api_key_here
+OKX_API_SECRET=your_api_secret_here
+OKX_PASSPHRASE=your_passphrase_here
+OKX_TESTNET=1
+OKX_INSTRUMENT_NAME=BTC-USDC
 ```
+
+For US/AU or EEA accounts, set the matching OKX regional endpoints with `OKX_REST_BASE_URL`, `OKX_WS_PUBLIC_URL`, and `OKX_WS_PRIVATE_URL`.
 
 > ⚠️ **Security**: `.env` is in `.gitignore` — your credentials will never be committed. The dashboard provides a UI to update credentials at runtime (and they get saved back to `.env`).
 
@@ -147,12 +149,12 @@ The dashboard runs a real-time web UI at port 5050:
 | **Real-time stats** | BTC index price, deviation from anchor, trade count, P&L |
 | **Order book** | Current open orders |
 | **Trade history** | Last 50 trades |
-| **API credentials** | Update ID/Secret/testnet at runtime |
+| **API credentials** | Update API Key/Secret/Passphrase/testnet at runtime |
 | **WebSocket push** | All data updates in real-time |
 
 操作流程：
 1. 打开 http://localhost:5050
-2. 如果 .env 没有凭证，在页面填写 API ID/Secret 并保存
+2. 如果 .env 没有凭证，在页面填写 API Key/Secret/Passphrase 并保存
 3. 点击 **🔌 测试连接** 确认连接成功
 4. 点击 **▶ 启动** → 策略初始化（连接、余额、锚点、RV）→ 状态变为"就绪"
 5. 再次点击 **▶ 启动** → 交易开启，maker 挂单开始工作
@@ -173,7 +175,8 @@ The dashboard runs a real-time web UI at port 5050:
 btc-yield-enhancer/
 ├── app.py                  # Flask web server + REST API + WebSocket
 ├── strategy_engine.py      # Core strategy logic (maker grid)
-├── deribit_api.py          # Deribit JSON-RPC client (auth, trade, data)
+├── okx_api.py              # OKX REST client (auth, trade, data)
+├── okx_ws.py               # OKX WebSocket client (ticker/account data)
 ├── requirements.txt        # Python dependencies
 ├── .env                    # API credentials (gitignored)
 ├── .env.example            # Template for .env (can be committed)
@@ -191,9 +194,9 @@ btc-yield-enhancer/
 ### Data Flow / 数据流
 
 ```
-Deribit Exchange
-      ↕ (JSON-RPC)
-deribit_api.py
+OKX Exchange
+      ↕ (REST + WebSocket)
+okx_api.py / okx_ws.py
       ↕
 strategy_engine.py (background thread: poll every 30s)
       ↕ (state callback)
@@ -231,6 +234,24 @@ Detailed parameter reference / 详细参数说明：
 | `cooldown_seconds` | 180 | 10–600 | Cool-down after each fill |
 | `min_poll_balance_usdc` | $200 | $10–$10,000 | Balance threshold for directional pause |
 
+### Dokploy / 部署
+
+Use a single replica only. This is a trading process with local runtime state.
+
+```env
+OKX_API_KEY=your_api_key_here
+OKX_API_SECRET=your_api_secret_here
+OKX_PASSPHRASE=your_passphrase_here
+OKX_TESTNET=1
+OKX_INSTRUMENT_NAME=BTC-USDC
+API_TOKEN=replace_with_a_long_random_value
+OKX_REST_BASE_URL=https://openapi.okx.com
+NIXPACKS_INSTALL_CMD=pip install -r requirements.txt gunicorn
+NIXPACKS_START_CMD=gunicorn --bind 0.0.0.0:5050 --workers 1 --threads 8 --timeout 120 app:app
+```
+
+Expose target port `5050`. Put the dashboard behind Basic Auth, Cloudflare Access, Tailscale, or another access control layer before using real funds.
+
 ---
 
 ## Maintenance / 维护
@@ -262,13 +283,13 @@ pip install -r requirements.txt --upgrade
 A: Yes. The strategy holds a BTC position between trades. It doesn't hedge — it's a directional maker grid that profits from volatility.
 
 **Q: What's the expected return?**
-A: Variable. With RV at 2% and 100 USDC trade size, each grid capture yields ~2 USDC per round trip (before fees). Deribit spot fees are 0.075%/0.07% (maker/taker) — maker-only orders minimize cost.
+A: Variable. With RV at 2% and 100 USDC trade size, each grid capture yields ~2 USDC per round trip before fees. Check your OKX fee tier before running with real funds.
 
 **Q: What if the market gaps through my order?**
 A: The order is post-only, so it won't be taken at a worse price. If the price passes through but your order doesn't fill (due to moving too fast), the next poll cycle detects the gap and triggers Plan A — chasing the index price.
 
 **Q: Can I run on testnet first?**
-A: Absolutely recommended. Set `DERIBIT_TESTNET=1` in `.env`, fund your testnet wallet from [Deribit Testnet Faucet](https://test.deribit.com/faucet).
+A: Absolutely recommended. Set `OKX_TESTNET=1` in `.env` and use OKX Demo Trading API keys.
 
 **Q: Does this affect other positions (futures, options)?**
 A: No. The strategy only touches BTC/USDC spot orders. It cancels by instrument name, not by currency.

@@ -19,10 +19,19 @@ def load_env():
 
 
 e = load_env()
-import deribit_api
+from okx_api import OKXClient
 
-testnet = e.get("DERIBIT_TESTNET", "1") == "1"
-c = deribit_api.DeribitClient(e["DERIBIT_ID"], e["DERIBIT_SECRET"], testnet=testnet)
-oid = sys.argv[1] if len(sys.argv) > 1 else "BTC_USDC-1205720404"
+testnet = e.get("OKX_TESTNET", "1") == "1"
+instrument_name = e.get("OKX_INSTRUMENT_NAME", "BTC-USDC")
+c = OKXClient(
+    e["OKX_API_KEY"],
+    e["OKX_API_SECRET"],
+    e["OKX_PASSPHRASE"],
+    testnet=testnet,
+    instrument_name=instrument_name,
+)
+oid = sys.argv[1] if len(sys.argv) > 1 else ""
+if not oid:
+    raise SystemExit("Usage: python cancel_test.py <okx_order_id>")
 r = c.cancel_order(oid)
 print("CANCEL_RESULT:", r)
