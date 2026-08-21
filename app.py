@@ -31,19 +31,22 @@ def _setup_logging():
     pythonw 下 stdout 被重定向到 os.devnull, 控制台 handler 无效但无害；
     关键是所有模块日志都通过 root logger 写入 btc.log, 解决可观测性缺口。
     """
-    log_dir = RUNTIME_PATHS.log_dir
-    os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, "btc.log")
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     # 避免 reload 场景叠加重复 handler
-    if not any(isinstance(h, logging.handlers.RotatingFileHandler) for h in root.handlers):
-        fh = logging.handlers.RotatingFileHandler(
-            log_file, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
-        )
-        fh.setFormatter(fmt)
-        root.addHandler(fh)
+    try:
+        log_dir = RUNTIME_PATHS.log_dir
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(log_dir, "btc.log")
+        if not any(isinstance(h, logging.handlers.RotatingFileHandler) for h in root.handlers):
+            fh = logging.handlers.RotatingFileHandler(
+                log_file, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+            )
+            fh.setFormatter(fmt)
+            root.addHandler(fh)
+    except Exception as e:
+        root.warning("File logging disabled: %s", e)
     if not any(isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler) for h in root.handlers):
         sh = logging.StreamHandler(sys.stdout)
         sh.setFormatter(fmt)
@@ -128,13 +131,23 @@ USE_TESTNET = os.environ.get("OKX_TESTNET", "1") == "1"
 # 可选 API 访问令牌：设置环境变量 API_TOKEN 后，所有写操作(POST)需带 X-API-Token 头
 API_TOKEN = os.environ.get("API_TOKEN", "").strip()
 
+CONFIG_ERROR = ""
 if not OKX_API_KEY or not OKX_API_SECRET or not OKX_PASSPHRASE:
-    raise RuntimeError(
-        "请设置环境变量 OKX_API_KEY、OKX_API_SECRET 和 OKX_PASSPHRASE\n"
-        "Linux/Mac: export OKX_API_KEY=xxx && export OKX_API_SECRET=xxx && export OKX_PASSPHRASE=xxx\n"
-        "Windows:   set OKX_API_KEY=xxx && set OKX_API_SECRET=xxx && set OKX_PASSPHRASE=xxx\n"
-        "或在项目根目录创建 .env 文件"
+    CONFIG_ERROR = (
+        "请设置环境变量 OKX_API_KEY、OKX_API_SECRET 和 OKX_PASSPHRASE，"
+        "或在 DATA_DIR/.env / 项目根目录 .env 文件中配置。"
     )
+    logger.error(CONFIG_ERROR)
+
+
+def _credentials_ready():
+    return not CONFIG_ERROR
+
+
+def _credentials_denied():
+    if _credentials_ready():
+        return None
+    return jsonify({"success": False, "message": CONFIG_ERROR}), 503
 
 # ---------------------------------------------------------------------------
 # Flask + WebSocket
@@ -263,6 +276,9 @@ def api_init():
     denied = _require_token()
     if denied:
         return denied
+    denied = _credentials_denied()
+    if denied:
+        return denied
     with engine_lock:
         if engine and engine._running:
             # 引擎已经在跑（不论是否交易中）→ 保持现状，不碰
@@ -292,6 +308,9 @@ def api_start():
     """启动交易"""
     global engine
     denied = _require_token()
+    if denied:
+        return denied
+    denied = _credentials_denied()
     if denied:
         return denied
     with engine_lock:
@@ -465,6 +484,9 @@ def api_params():
 @app.route("/btc-enhancer/api/kline")
 def api_kline():
     """拉 OKX 当前现货标的 K 线"""
+    denied = _credentials_denied()
+    if denied:
+        return denied
     try:
         end = int(pytime.time() * 1000)
         start = end - 7 * 86400 * 1000
@@ -481,6 +503,11 @@ def api_kline():
 
 @app.route("/btc-enhancer/api/test-connection")
 def api_test_connection():
+    if not _credentials_ready():
+        return jsonify({
+            "mainnet": {"connected": False, "auth_error": CONFIG_ERROR},
+            "testnet": {"connected": False, "auth_error": CONFIG_ERROR},
+        })
     results = {}
     for label, testnet in [("mainnet", False), ("testnet", True)]:
         client = OKXClient(
@@ -517,6 +544,9 @@ def api_config():
             return jsonify({"error": "Engine not initialized"}), 503
         return jsonify(engine.cfg)
     denied = _require_token()
+    if denied:
+        return denied
+    denied = _credentials_denied()
     if denied:
         return denied
     data = request.get_json()

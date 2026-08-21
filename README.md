@@ -248,10 +248,9 @@ OKX_INSTRUMENT_NAME=BTC-USDC
 DATA_DIR=/data
 API_TOKEN=replace_with_a_long_random_value
 OKX_REST_BASE_URL=https://openapi.okx.com
-NIXPACKS_START_CMD=gunicorn --bind 0.0.0.0:5050 --workers 1 --threads 8 --timeout 120 app:app
 ```
 
-Expose target port `5050`. Add a Dokploy volume mounted at `/data` so `state.json`, `state_backups/`, `logs/`, and dashboard-saved `.env` survive redeploys. Put the dashboard behind Basic Auth, Cloudflare Access, Tailscale, or another access control layer before using real funds.
+The repository includes `nixpacks.toml`, so no custom Nixpacks install/start command is required in Dokploy. Expose target port `5050`. Add a Dokploy volume mounted at `/data` so `state.json`, `state_backups/`, `logs/`, and dashboard-saved `.env` survive redeploys. Put the dashboard behind Basic Auth, Cloudflare Access, Tailscale, or another access control layer before using real funds.
 
 ---
 
