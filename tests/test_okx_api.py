@@ -39,7 +39,89 @@ class RejectSession:
         })
 
 
+class IndexSession:
+    def __init__(self):
+        self.calls = []
+
+    def request(self, method, url, headers=None, params=None, data=None, timeout=None):
+        self.calls.append({"method": method, "url": url, "params": params or {}})
+        if url.endswith("/market/index-tickers"):
+            return FakeResponse({
+                "code": "0",
+                "msg": "",
+                "data": [{"instId": "BTC-USDC", "idxPx": "64250.5"}],
+            })
+        if url.endswith("/market/index-candles"):
+            return FakeResponse({
+                "code": "0",
+                "msg": "",
+                "data": [
+                    ["3000", "103", "104", "102", "103.5", "1"],
+                    ["2000", "101", "102", "100", "101.5", "1"],
+                    ["1000", "100", "101", "99", "100.5", "1"],
+                    ["5000", "105", "106", "104", "105.5", "1"],
+                ],
+            })
+        raise AssertionError(f"unexpected URL: {url}")
+
+
+class BalanceSession:
+    def request(self, method, url, headers=None, params=None, data=None, timeout=None):
+        return FakeResponse({
+            "code": "0",
+            "msg": "",
+            "data": [{
+                "details": [{
+                    "ccy": "USDC",
+                    "availBal": "90.5",
+                    "cashBal": "100.0",
+                    "eq": "125.75",
+                }],
+            }],
+        })
+
+
 class OKXClientTests(unittest.TestCase):
+    def test_index_price_uses_okx_index_ticker(self):
+        session = IndexSession()
+        client = OKXClient("key", "secret", "passphrase", session=session)
+
+        price = client.get_index_price("BTC-USDC")
+
+        self.assertEqual(price, 64250.5)
+        self.assertEqual(session.calls[0]["url"], "https://openapi.okx.com/api/v5/market/index-tickers")
+        self.assertEqual(session.calls[0]["params"], {"instId": "BTC-USDC"})
+
+    def test_index_candles_use_index_endpoint_and_confirm_field(self):
+        session = IndexSession()
+        client = OKXClient("key", "secret", "passphrase", session=session)
+
+        normalized = client.get_index_chart_data(
+            "BTC-USDC", 1000, 4000, "5", limit=3,
+        )
+
+        self.assertEqual(normalized["ticks"], [1000, 2000, 3000])
+        self.assertEqual(normalized["open"], [100.0, 101.0, 103.0])
+        self.assertEqual(normalized["confirm"], [True, True, True])
+        self.assertEqual(session.calls[0]["url"], "https://openapi.okx.com/api/v5/market/index-candles")
+        self.assertEqual(session.calls[0]["params"], {
+            "instId": "BTC-USDC",
+            "bar": "5m",
+            "after": "4000",
+            "before": "1000",
+            "limit": "3",
+        })
+
+    def test_account_summary_preserves_available_and_equity_balances(self):
+        client = OKXClient("key", "secret", "passphrase", session=BalanceSession())
+
+        summary = client.get_account_summary("USDC")
+
+        self.assertEqual(summary["balance"], 90.5)
+        self.assertEqual(summary["available"], 90.5)
+        self.assertEqual(summary["total_balance"], 125.75)
+        self.assertEqual(summary["equity"], 125.75)
+
     def test_buy_post_only_order_uses_okx_maker_order_type(self):
         session = FakeSession()
         client = OKXClient("key", "secret", "passphrase", session=session)

@@ -255,11 +255,12 @@ class OKXClient:
 
     def get_index_price(self, index_name: str = "BTC-USDC") -> Optional[float]:
         instrument_name = (index_name or self.instrument_name).replace("_", "-").upper()
-        response = self._request("GET", "/api/v5/market/ticker", params={"instId": instrument_name})
+        response = self._request(
+            "GET", "/api/v5/market/index-tickers", params={"instId": instrument_name}
+        )
         if not response["success"] or not response["result"]:
             return None
-        ticker = response["result"][0]
-        return _f(ticker.get("last") or ticker.get("idxPx"))
+        return _f(response["result"][0].get("idxPx"))
 
     def get_instruments(self, currency: str = "BTC", kind: str = "spot") -> list[dict]:
         params = {"instType": "SPOT"}
@@ -306,6 +307,35 @@ class OKXClient:
             return self._normalize_candles(response["result"])
         return None
 
+    def get_index_chart_data(
+        self,
+        instrument_name: str,
+        start_timestamp: int,
+        end_timestamp: int,
+        resolution: str = "5",
+        limit: int = 100,
+    ) -> Optional[dict]:
+        """Get OKX index candles in the normalized strategy data shape."""
+        params = {
+            "instId": instrument_name.replace("_", "-").upper(),
+            "bar": self._normalize_bar(resolution),
+            "after": str(int(end_timestamp)),
+            "before": str(int(start_timestamp)),
+            "limit": str(max(1, min(int(limit), 100))),
+        }
+        response = self._request(
+            "GET", "/api/v5/market/index-candles", params=params,
+        )
+        if response["success"]:
+            start_ms = int(start_timestamp)
+            end_ms = int(end_timestamp)
+            candles = [
+                candle for candle in response["result"]
+                if candle and start_ms <= int(candle[0]) <= end_ms
+            ]
+            return self._normalize_index_candles(candles)
+        return None
+
     @staticmethod
     def _normalize_bar(resolution: str) -> str:
         mapping = {
@@ -347,6 +377,34 @@ class OKXClient:
             "status": "ok",
         }
 
+    @staticmethod
+    def _normalize_index_candles(candles: list[list]) -> dict:
+        sorted_candles = sorted(candles, key=lambda candle: int(candle[0]))
+        ticks = []
+        opens = []
+        highs = []
+        lows = []
+        closes = []
+        confirmations = []
+        for candle in sorted_candles:
+            if len(candle) < 6:
+                continue
+            ticks.append(int(candle[0]))
+            opens.append(_f(candle[1]))
+            highs.append(_f(candle[2]))
+            lows.append(_f(candle[3]))
+            closes.append(_f(candle[4]))
+            confirmations.append(str(candle[5]) == "1")
+        return {
+            "ticks": ticks,
+            "open": opens,
+            "high": highs,
+            "low": lows,
+            "close": closes,
+            "confirm": confirmations,
+            "status": "ok",
+        }
+
     def get_account_summary(self, currency: str = "USDC", extended: bool = True) -> Optional[dict]:
         response = self._request(
             "GET",
@@ -360,14 +418,23 @@ class OKXClient:
         for detail in details:
             if detail.get("ccy") == currency.upper():
                 available = _f(detail.get("availBal"), _f(detail.get("cashBal")))
+                cash_balance = _f(detail.get("cashBal"), available)
+                equity = _f(detail.get("eq"), cash_balance)
                 return {
                     "currency": currency.upper(),
                     "balance": available,
                     "available": available,
-                    "equity": _f(detail.get("eq"), available),
+                    "total_balance": equity,
+                    "equity": equity,
                     "raw": detail,
                 }
-        return {"currency": currency.upper(), "balance": 0.0, "available": 0.0, "equity": 0.0}
+        return {
+            "currency": currency.upper(),
+            "balance": 0.0,
+            "available": 0.0,
+            "total_balance": 0.0,
+            "equity": 0.0,
+        }
 
     def get_positions(self, currency: str = "BTC", kind: str = "any") -> list[dict]:
         return []

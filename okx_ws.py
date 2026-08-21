@@ -14,9 +14,12 @@ import hmac
 import json
 import logging
 import os
+import ssl
 import threading
 import time
 from typing import Any, Callable, Optional
+
+import certifi
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +71,8 @@ class OKXWSClient:
         self._cache_lock = threading.Lock()
         self._cached_usdc_balance = 0.0
         self._cached_btc_balance = 0.0
+        self._cached_usdc_available = 0.0
+        self._cached_btc_available = 0.0
         self._cached_index_price = 0.0
 
         self.connected = False
@@ -88,6 +93,10 @@ class OKXWSClient:
             return parts[0], parts[1]
         return "BTC", "USDC"
 
+    @staticmethod
+    def _ssl_context() -> ssl.SSLContext:
+        return ssl.create_default_context(cafile=certifi.where())
+
     @property
     def cached_usdc_balance(self) -> float:
         with self._cache_lock:
@@ -107,6 +116,26 @@ class OKXWSClient:
     def cached_btc_balance(self, value: float):
         with self._cache_lock:
             self._cached_btc_balance = value
+
+    @property
+    def cached_usdc_available(self) -> float:
+        with self._cache_lock:
+            return self._cached_usdc_available
+
+    @cached_usdc_available.setter
+    def cached_usdc_available(self, value: float):
+        with self._cache_lock:
+            self._cached_usdc_available = value
+
+    @property
+    def cached_btc_available(self) -> float:
+        with self._cache_lock:
+            return self._cached_btc_available
+
+    @cached_btc_available.setter
+    def cached_btc_available(self, value: float):
+        with self._cache_lock:
+            self._cached_btc_available = value
 
     @property
     def cached_index_price(self) -> float:
@@ -172,7 +201,12 @@ class OKXWSClient:
     async def _public_main(self):
         import websockets
 
-        async with websockets.connect(self.ws_public_url, ping_interval=None, close_timeout=5) as ws:
+        async with websockets.connect(
+            self.ws_public_url,
+            ssl=self._ssl_context(),
+            ping_interval=None,
+            close_timeout=5,
+        ) as ws:
             self._public_connected = True
             self._update_connected()
             self._reconnect_delay = 5.0
@@ -182,7 +216,12 @@ class OKXWSClient:
     async def _private_main(self):
         import websockets
 
-        async with websockets.connect(self.ws_private_url, ping_interval=None, close_timeout=5) as ws:
+        async with websockets.connect(
+            self.ws_private_url,
+            ssl=self._ssl_context(),
+            ping_interval=None,
+            close_timeout=5,
+        ) as ws:
             self._private_connected = True
             self._update_connected()
             self._reconnect_delay = 5.0
@@ -195,12 +234,12 @@ class OKXWSClient:
 
     async def _subscribe_public(self, ws):
         msg = {
-            "id": "ticker",
+            "id": "index-ticker",
             "op": "subscribe",
-            "args": [{"channel": "tickers", "instId": self.instrument_name}],
+            "args": [{"channel": "index-tickers", "instId": self.instrument_name}],
         }
         await ws.send(json.dumps(msg))
-        logger.info("OKX WS public subscribed: %s", self.instrument_name)
+        logger.info("OKX WS index ticker subscribed: %s", self.instrument_name)
 
     async def _login_private(self, ws):
         timestamp = str(int(time.time()))
@@ -240,6 +279,7 @@ class OKXWSClient:
         args = [
             {"channel": "account", "ccy": self.base_currency},
             {"channel": "account", "ccy": self.quote_currency},
+            {"channel": "orders", "instType": "SPOT", "instId": self.instrument_name},
         ]
         await ws.send(json.dumps({"id": "account", "op": "subscribe", "args": args}))
         logger.info("OKX WS private subscribed: account %s/%s", self.base_currency, self.quote_currency)
@@ -293,14 +333,17 @@ class OKXWSClient:
         if not rows:
             return
 
-        if channel == "tickers":
-            self._handle_ticker(rows[0])
+        if channel == "index-tickers":
+            self._handle_index_ticker(rows[0])
         elif channel == "account":
             for row in rows:
                 self._handle_account(row)
+        elif channel == "orders":
+            for row in rows:
+                self._handle_order(row)
 
-    def _handle_ticker(self, row: dict):
-        price = _f(row.get("last") or row.get("idxPx"))
+    def _handle_index_ticker(self, row: dict):
+        price = _f(row.get("idxPx"))
         if price <= 0:
             return
         self.cached_index_price = price
@@ -312,13 +355,42 @@ class OKXWSClient:
     def _handle_account(self, row: dict):
         for detail in row.get("details", []):
             currency = detail.get("ccy", "").upper()
-            balance = _f(detail.get("availBal"), _f(detail.get("cashBal")))
+            available = _f(detail.get("availBal"), _f(detail.get("cashBal")))
+            equity = _f(detail.get("eq"), _f(detail.get("cashBal"), available))
             if currency == self.base_currency:
-                self.cached_btc_balance = balance
-                self._emit({"channel": "user.portfolio.btc", "data": {"balance": balance}})
+                self.cached_btc_balance = equity
+                self.cached_btc_available = available
+                self._emit({
+                    "channel": "user.portfolio.btc",
+                    "data": {"balance": equity, "available": available, "equity": equity},
+                })
             elif currency == self.quote_currency:
-                self.cached_usdc_balance = balance
-                self._emit({"channel": "user.portfolio.usdc", "data": {"balance": balance}})
+                self.cached_usdc_balance = equity
+                self.cached_usdc_available = available
+                self._emit({
+                    "channel": "user.portfolio.usdc",
+                    "data": {"balance": equity, "available": available, "equity": equity},
+                })
+
+    def _handle_order(self, row: dict):
+        """Normalize an OKX orders-channel update for StrategyEngine."""
+        self._emit({
+            "channel": "user.order",
+            "data": {
+                "order_id": row.get("ordId", ""),
+                "state": row.get("state", ""),
+                "side": row.get("side", ""),
+                "instrument_name": row.get("instId", self.instrument_name),
+                "label": row.get("clOrdId", ""),
+                "amount": _f(row.get("sz")),
+                "price": _f(row.get("px")),
+                "filled_amount": _f(row.get("accFillSz")),
+                "fill_amount": _f(row.get("fillSz")),
+                "fill_price": _f(row.get("fillPx")),
+                "average_price": _f(row.get("avgPx")),
+                "timestamp": row.get("uTime") or row.get("fillTime") or row.get("cTime", ""),
+            },
+        })
 
     def _emit(self, msg: dict):
         if self._user_callback:
@@ -334,5 +406,7 @@ class OKXWSClient:
             "error": self.error,
             "cached_usdc_balance": self.cached_usdc_balance,
             "cached_btc_balance": self.cached_btc_balance,
+            "cached_usdc_available": self.cached_usdc_available,
+            "cached_btc_available": self.cached_btc_available,
             "cached_index_price": self.cached_index_price,
         }

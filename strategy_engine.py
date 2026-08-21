@@ -18,9 +18,11 @@ import time
 import math
 import json
 import os
+import queue
 import logging
 import threading
 from datetime import datetime, timezone, timedelta
+from decimal import Decimal, ROUND_HALF_UP
 from statistics import stdev
 from typing import Optional
 
@@ -85,6 +87,8 @@ class StrategyEngine:
         self.initial_btc = 0.0
         self.usdc_balance = 0.0
         self.btc_balance = 0.0
+        self.usdc_available = 0.0
+        self.btc_available = 0.0
         self.btc_value_usdc = 0.0
         self.total_value_usdc = 0.0
         self.btc_index_price = 0.0
@@ -112,6 +116,11 @@ class StrategyEngine:
         self.open_orders: list[dict] = []  # 当前挂单列表
         self._our_buy_id: Optional[str] = None   # 我们挂的买入单 ID
         self._our_sell_id: Optional[str] = None  # 我们挂的卖出单 ID
+        self._processed_fill_amounts: dict[str, float] = {}
+        self._processed_fill_costs: dict[str, float] = {}
+        self._fill_lock = threading.Lock()
+        self._order_event_queue: queue.Queue = queue.Queue()
+        self._order_event_worker: Optional[threading.Thread] = None
 
         # WebSocket 客户端（实时数据源）
         self._ws: Optional[OKXWSClient] = None
@@ -221,17 +230,26 @@ class StrategyEngine:
     def _round_amount(self, amount_btc):
         if self.contract_size <= 0:
             return round(amount_btc, 6)
-        units = max(1, round(amount_btc / self.contract_size)) if amount_btc > 0 else 0
-        raw = units * self.contract_size
-        cs_str = f"{self.contract_size:.10f}".rstrip("0").rstrip(".")
-        decimals = max(0, len(cs_str.split(".")[1]) if "." in cs_str else 0)
-        return round(raw, decimals)
+        if amount_btc <= 0:
+            return 0
+        step = Decimal(str(self.contract_size))
+        units = max(
+            1,
+            int((Decimal(str(amount_btc)) / step).quantize(
+                Decimal("1"), rounding=ROUND_HALF_UP
+            )),
+        )
+        return float(units * step)
+
     def _round_price(self, price: float) -> float:
-        """按 tick_size 取整价格（BTC=1, ETH=0.1）"""
+        """按交易所 tick_size 取最近价格档位。"""
         if self.tick_size <= 0:
             return round(price, 1)
-        decimals = max(0, round(-math.log10(self.tick_size)))
-        return round(round(price / self.tick_size) * self.tick_size, decimals)
+        step = Decimal(str(self.tick_size))
+        units = (Decimal(str(price)) / step).quantize(
+            Decimal("1"), rounding=ROUND_HALF_UP
+        )
+        return float(units * step)
 
     def _fetch_instrument_info(self):
         try:
@@ -262,6 +280,17 @@ class StrategyEngine:
             self.api.cancel_all_by_instrument(self.cfg["instrument_name"])
         except Exception:
             pass
+        self._running = True
+        self._trading_enabled = False
+        self._our_buy_id = None
+        self._our_sell_id = None
+        self._processed_fill_amounts.clear()
+        self._processed_fill_costs.clear()
+        self._order_event_queue = queue.Queue()
+        self._order_event_worker = threading.Thread(
+            target=self._order_event_loop, daemon=True,
+        )
+        self._order_event_worker.start()
         # 启动 WebSocket 客户端（后台线程）
         try:
             self._ws = OKXWSClient(
@@ -276,10 +305,6 @@ class StrategyEngine:
         except Exception as e:
             logger.warning("WS client start failed (will use REST only): %s", e)
             self._ws_enabled = False
-        self._running = True
-        self._trading_enabled = False
-        self._our_buy_id = None
-        self._our_sell_id = None
         self._thread = threading.Thread(target=self._data_loop, daemon=True)
         self._thread.start()
         return True
@@ -312,10 +337,14 @@ class StrategyEngine:
                 pass
             self._ws = None
             self._ws_enabled = False
+        self._running = False
+        self._order_event_queue.put(None)
+        if self._order_event_worker and self._order_event_worker is not threading.current_thread():
+            self._order_event_worker.join(timeout=1.0)
+        self._order_event_worker = None
         # 先取消我们的挂单
         self._cancel_our_orders()
         self._save_state()
-        self._running = False
         self._trading_enabled = False
         self._set_status("stopped")
         self._notify_state()
@@ -344,6 +373,8 @@ class StrategyEngine:
                 "initial_total_usdc": self.initial_total_usdc,
                 "usdc_balance": self.usdc_balance,
                 "btc_balance": self.btc_balance,
+                "usdc_available": self.usdc_available,
+                "btc_available": self.btc_available,
                 "btc_value_usdc": self.btc_value_usdc,
                 "total_value_usdc": self.total_value_usdc,
                 "btc_index_price": self.btc_index_price,
@@ -420,6 +451,7 @@ class StrategyEngine:
                 self._set_status("error")
                 self._add_error("Strategy initialization failed")
                 self._running = False
+                self._order_event_queue.put(None)
                 return
 
             self._set_status("ready")
@@ -457,6 +489,17 @@ class StrategyEngine:
             self._set_status("error")
 
         logger.info("=== Data loop ended ===")
+
+    def _order_event_loop(self):
+        """Process order events outside the asyncio WebSocket callback thread."""
+        while True:
+            data = self._order_event_queue.get()
+            if data is None:
+                return
+            try:
+                self._handle_order_event(data)
+            except Exception as exc:
+                logger.warning("Order event processing error: %s", exc)
 
     def _notify_state(self):
         """通知前端状态更新（WebSocket 回调）"""
@@ -593,26 +636,31 @@ class StrategyEngine:
         """用当前现货标的 5 分钟 K 线，取 12 根(1小时窗口)的 RMS × √24 作为日化 RV"""
         end = int(time.time() * 1000)
         start = end - 3 * 3600 * 1000  # 拉3小时确保有12根
-        data = self.api.get_tradingview_chart_data(self.cfg["instrument_name"], start, end, "5")
+        data = self.api.get_index_chart_data(self.cfg["index_name"], start, end, "5")
         if not data or not data.get("close") or not data.get("open"):
             return self._fallback_rv()
 
-        opens = [o for o in data["open"] if o and o > 0]
-        closes = [c for c in data["close"] if c and c > 0]
-        min_len = min(len(opens), len(closes))
-        if min_len < 12:
+        opens = data["open"]
+        closes = data["close"]
+        confirmations = data.get("confirm")
+        bars = []
+        for i in range(min(len(opens), len(closes))):
+            if confirmations and (i >= len(confirmations) or not confirmations[i]):
+                continue
+            if opens[i] and opens[i] > 0 and closes[i] and closes[i] > 0:
+                bars.append((opens[i], closes[i]))
+
+        if len(bars) < 12:
             return self._fallback_rv()
 
-        opens = opens[-12:]
-        closes = closes[-12:]
+        bars = bars[-12:]
 
         sq_sum = 0.0
         n = 0
-        for i in range(len(opens)):
-            if opens[i] > 0:
-                r = (closes[i] - opens[i]) / opens[i]
-                sq_sum += r * r
-                n += 1
+        for open_price, close_price in bars:
+            r = (close_price - open_price) / open_price
+            sq_sum += r * r
+            n += 1
 
         if n < 12:
             return self._fallback_rv()
@@ -634,20 +682,24 @@ class StrategyEngine:
             channel = msg.get("channel", "")
             data = msg.get("data", {})
             if channel == "user.portfolio.btc":
-                bal = data.get("balance", 0)
-                if bal is not None and float(bal) >= 0:
+                equity = data.get("equity", data.get("balance", 0))
+                available = data.get("available", data.get("balance", equity))
+                if equity is not None and float(equity) >= 0:
                     old = self.btc_balance
-                    self.btc_balance = float(bal)
+                    self.btc_balance = float(equity)
+                    self.btc_available = max(0.0, float(available))
                     self._last_ws_balance_update = time.time()
                     if abs(self.btc_balance - old) > 1e-6:
                         logger.info("WS[btc]: %.6f -> %.6f", old, self.btc_balance)
                     if self.btc_index_price > 0:
                         self._recalc_values()
             elif channel == "user.portfolio.usdc":
-                bal = data.get("balance", 0)
-                if bal is not None and float(bal) >= 0:
+                equity = data.get("equity", data.get("balance", 0))
+                available = data.get("available", data.get("balance", equity))
+                if equity is not None and float(equity) >= 0:
                     old = self.usdc_balance
-                    self.usdc_balance = float(bal)
+                    self.usdc_balance = float(equity)
+                    self.usdc_available = max(0.0, float(available))
                     self._last_ws_balance_update = time.time()
                     if abs(self.usdc_balance - old) > 1e-6:
                         logger.info("WS[usdc]: %.2f -> %.2f", old, self.usdc_balance)
@@ -664,12 +716,165 @@ class StrategyEngine:
                     self._last_ws_index_update = time.time()
                     self._recalc_values()
                     self.api_connected = True
+            elif channel == "user.order":
+                if self._order_event_worker and self._order_event_worker.is_alive():
+                    self._order_event_queue.put(data)
+                else:
+                    self._handle_order_event(data)
             # WS 有推送说明连接正常
             self.api_connected = True
             if channel not in ("heartbeat",):
                 self._last_ws_check_ts = time.time()
         except Exception as e:
             logger.warning("WS callback error: %s", e)
+
+    def _handle_order_event(self, data: dict):
+        """Process an OKX orders-channel update without double-counting fills."""
+        order_id = str(data.get("order_id", ""))
+        instrument = data.get("instrument_name", "")
+        side = data.get("side", "")
+        label = data.get("label", "")
+        if not order_id:
+            return
+        if side not in ("buy", "sell"):
+            return
+
+        instrument = instrument.replace("_", "-").upper()
+        expected_instrument = self.cfg["instrument_name"].replace("_", "-").upper()
+        if instrument and instrument != expected_instrument:
+            return
+
+        tracked = order_id in (self._our_buy_id, self._our_sell_id)
+        label = str(label).lower().replace("-", "_")
+        maker_labels = {
+            "buy": {"maker_buy", "makerbuy"},
+            "sell": {"maker_sell", "makersell"},
+        }
+        labeled = label in maker_labels[side]
+        if not tracked and not labeled:
+            return
+        if labeled and side == "buy" and not self._our_buy_id:
+            self._our_buy_id = order_id
+        elif labeled and side == "sell" and not self._our_sell_id:
+            self._our_sell_id = order_id
+
+        cumulative_amount = float(data.get("filled_amount", 0) or 0)
+        if cumulative_amount <= 0:
+            cumulative_amount = float(data.get("fill_amount", 0) or 0)
+        if cumulative_amount > 0:
+            fill_price = float(
+                data.get("fill_price", 0)
+                or data.get("average_price", 0)
+                or 0
+            )
+            self._process_order_fill(side, order_id, cumulative_amount, fill_price)
+
+        state = str(data.get("state", "")).lower()
+        if state in ("filled", "canceled", "cancelled", "mmp_canceled"):
+            if self._our_buy_id == order_id:
+                self._our_buy_id = None
+            if self._our_sell_id == order_id:
+                self._our_sell_id = None
+
+    def _process_order_fill(
+        self,
+        side_key: str,
+        order_id: str,
+        cumulative_amount: float,
+        fill_price: float,
+        cumulative_cost: Optional[float] = None,
+    ) -> bool:
+        """Record only the new cumulative fill amount for an order."""
+        if cumulative_amount <= 0 or fill_price <= 0:
+            return False
+        with self._fill_lock:
+            previous_amount = self._processed_fill_amounts.get(order_id, 0.0)
+            delta_amount = cumulative_amount - previous_amount
+            if delta_amount <= 1e-12:
+                return False
+
+            previous_cost = self._processed_fill_costs.get(order_id, 0.0)
+            if cumulative_cost is None:
+                delta_cost = delta_amount * fill_price
+                next_cost = previous_cost + delta_cost
+            else:
+                next_cost = cumulative_cost
+                delta_cost = next_cost - previous_cost
+                if delta_cost <= 0:
+                    delta_cost = delta_amount * fill_price
+                    next_cost = previous_cost + delta_cost
+            delta_price = delta_cost / delta_amount
+            self._processed_fill_amounts[order_id] = cumulative_amount
+            self._processed_fill_costs[order_id] = next_cost
+
+            self._log_info("%s maker order %s fill +%.6f BTC @ %.2f",
+                           side_key, order_id, delta_amount, delta_price)
+            self._cooldown_until = time.time() + self.cfg.get("cooldown_seconds", 180)
+            self.anchor_price = delta_price
+            self._update_rv()
+            self._recalc_thresholds()
+            self._fetch_balances()
+
+            with self._lock:
+                if side_key == "buy":
+                    self.buy_inventory.append([round(delta_amount, 6), delta_price])
+                else:
+                    remaining = delta_amount
+                    while remaining > 1e-6 and self.buy_inventory:
+                        lot = self.buy_inventory[0]
+                        take = min(lot[0], remaining)
+                        self.realized_pnl += take * (delta_price - lot[1])
+                        lot[0] -= take
+                        remaining -= take
+                        if lot[0] <= 1e-6:
+                            self.buy_inventory.pop(0)
+                    if remaining > 1e-6:
+                        self._log_info(
+                            "Sell %.6f exceeds buy inventory, partial PNL skipped",
+                            remaining,
+                        )
+                self.trades.append({
+                    "id": f"{'B' if side_key == 'buy' else 'S'}{int(time.time())}",
+                    "time": datetime.now(BJT).isoformat(),
+                    "side": side_key,
+                    "amount_btc": round(delta_amount, 6),
+                    "price": delta_price,
+                    "total_usdc": round(delta_amount * delta_price, 2),
+                    "order_id": order_id,
+                    "status": "filled",
+                    "label": "maker",
+                })
+                self.total_trades += 1
+                if len(self.trades) > 500:
+                    self.trades = self.trades[-500:]
+            self._save_state()
+
+            other_id = self._our_buy_id if side_key == "sell" else self._our_sell_id
+            if other_id and other_id != order_id:
+                r = self.api.cancel_order(other_id)
+                if not r["success"]:
+                    self._route_api_error(
+                        "cancel", r, "buy" if side_key == "sell" else "sell"
+                    )
+                if side_key == "sell":
+                    self._our_buy_id = None
+                else:
+                    self._our_sell_id = None
+
+            idx = self.btc_index_price
+            if idx > 0:
+                deviation = abs(idx / self.anchor_price - 1)
+                if deviation > self.daily_rv:
+                    old_anchor = self.anchor_price
+                    self.anchor_price = idx
+                    self._update_rv()
+                    self._recalc_thresholds()
+                    self._log_info(
+                        "方案A: Anchor追 %.2f -> %.2f (deviation %.4f%%), RV=%.2f%%",
+                        old_anchor, idx, deviation * 100, self.daily_rv * 100,
+                    )
+                    self._cooldown_until = time.time() + self.cfg.get("cooldown_seconds", 180)
+            return True
 
     def _recalc_values(self):
         """根据当前余额和指数价重算 USDC 价值"""
@@ -713,18 +918,38 @@ class StrategyEngine:
             # WS 在线，但余额推送可能静默中断：超过阈值则回 REST 刷新
             if time.time() - self._last_ws_balance_update < self._BALANCE_REST_INTERVAL:
                 self.api_connected = True
-                return {"usdc_balance": self.usdc_balance, "btc_balance": self.btc_balance}
+                return {
+                    "usdc_balance": self.usdc_balance,
+                    "btc_balance": self.btc_balance,
+                    "usdc_available": self.usdc_available,
+                    "btc_available": self.btc_available,
+                }
             # WS 余额疑似过期，fall through 到 REST 兜底
         # WS 不可用，REST fallback
         try:
             base_currency, quote_currency = self.cfg["instrument_name"].replace("_", "-").split("-")[:2]
             quote = self.api.get_account_summary(currency=quote_currency)
             if quote:
-                self.usdc_balance = float(quote.get("balance", 0))
+                self.usdc_balance = float(
+                    quote.get("equity", quote.get("total_balance", quote.get("balance", 0))) or 0
+                )
+                self.usdc_available = float(
+                    quote.get("available", quote.get("balance", self.usdc_balance)) or 0
+                )
             base = self.api.get_account_summary(currency=base_currency)
             if base:
-                self.btc_balance = float(base.get("balance", 0))
-            return {"usdc_balance": self.usdc_balance, "btc_balance": self.btc_balance}
+                self.btc_balance = float(
+                    base.get("equity", base.get("total_balance", base.get("balance", 0))) or 0
+                )
+                self.btc_available = float(
+                    base.get("available", base.get("balance", self.btc_balance)) or 0
+                )
+            return {
+                "usdc_balance": self.usdc_balance,
+                "btc_balance": self.btc_balance,
+                "usdc_available": self.usdc_available,
+                "btc_available": self.btc_available,
+            }
         except Exception as e:
             logger.error("Fetch balances (REST fallback): %s", e)
             return None
@@ -748,6 +973,7 @@ class StrategyEngine:
                     "order_id": o.get("order_id", ""),
                     "side": o.get("direction", ""),
                     "price": float(o.get("price", 0) or 0),
+                    "average_price": float(o.get("average_price", 0) or 0),
                     "amount": amount,
                     "filled": filled,
                     "remaining": amount - filled,
@@ -759,6 +985,59 @@ class StrategyEngine:
         except Exception as e:
             logger.error("Fetch open orders: %s", e)
 
+    def _reconcile_open_order_fills(self):
+        """Reconcile cumulative partial fills when an order WS event was missed."""
+        tracked_orders = {
+            self._our_buy_id: "buy",
+            self._our_sell_id: "sell",
+        }
+        for order in self.open_orders:
+            order_id = order.get("order_id")
+            side = tracked_orders.get(order_id)
+            if not order_id or not side:
+                continue
+            filled_amount = float(order.get("filled", 0) or 0)
+            fill_price = float(
+                order.get("average_price", 0)
+                or order.get("price", 0)
+                or 0
+            )
+            if filled_amount > 0 and fill_price > 0:
+                average_price = float(order.get("average_price", 0) or 0)
+                cumulative_cost = (
+                    filled_amount * average_price if average_price > 0 else None
+                )
+                self._process_order_fill(
+                    side, order_id, filled_amount, fill_price, cumulative_cost,
+                )
+
+    def _reconcile_missing_order(
+        self, side_key: str, order_id: str, default_price: float,
+    ) -> Optional[str]:
+        """Reconcile a terminal order, including fills before cancellation."""
+        order_result = self.api.get_order_state(order_id)
+        if not order_result["success"]:
+            return None
+
+        parsed = self.api.parse_order_result(order_result.get("result") or {})
+        state = parsed["state"]
+        if state == "open":
+            return state
+
+        fill_price = parsed["average_price"] or default_price
+        filled_amount = parsed["filled_amount"]
+        if state == "filled" and filled_amount <= 0 and fill_price > 0:
+            filled_amount = self.cfg["trade_size_usdc"] / fill_price
+        if filled_amount > 0 and fill_price > 0:
+            average_price = parsed["average_price"]
+            cumulative_cost = (
+                filled_amount * average_price if average_price > 0 else None
+            )
+            self._process_order_fill(
+                side_key, order_id, filled_amount, fill_price, cumulative_cost,
+            )
+        return state
+
     # ------------------------------------------------------------------
     # 资金检查（买卖方向独立）
     # ------------------------------------------------------------------
@@ -769,18 +1048,18 @@ class StrategyEngine:
         price = self.btc_index_price
 
         # USDC 检查
-        if self.usdc_balance < threshold:
+        if self.usdc_available < threshold:
             if not self.usdc_insufficient:
                 self.usdc_insufficient = True
                 self._log_info("USDC insufficient (%.2f < %.2f), buy paused",
-                               self.usdc_balance, threshold)
+                               self.usdc_available, threshold)
         else:
             if self.usdc_insufficient:
                 self.usdc_insufficient = False
-                self._log_info("USDC restored (%.2f), buy resumed", self.usdc_balance)
+                self._log_info("USDC restored (%.2f), buy resumed", self.usdc_available)
 
         # BTC 检查（按市价折算 USDC）
-        btc_value = self.btc_balance * price if price > 0 else 0
+        btc_value = self.btc_available * price if price > 0 else 0
         if btc_value < threshold:
             if not self.btc_insufficient:
                 self.btc_insufficient = True
@@ -836,6 +1115,9 @@ class StrategyEngine:
                     setattr(self, our_attr, existing)
                     self._log_info("Reclaimed %s order %s at price %d", side, existing, target_price)
 
+        # WS 丢失时，按订单累计成交量补齐仍在挂单列表中的部分成交。
+        self._reconcile_open_order_fills()
+
         # --- 检测成交：订单消失后查交易所订单状态判断是否真成交 ---
         # Bugfix v1.9: 不再依赖余额变化（期权估值会污染 BTC balance），
         # 改为直接查询 get_order_state 的 order_state 字段。
@@ -843,112 +1125,29 @@ class StrategyEngine:
             our_id = getattr(self, our_id_attr)
             if our_id and our_id not in current_ids:
                 # 查交易所订单状态确认是否成交
-                is_filled = False
                 try:
-                    order_result = self.api.get_order_state(our_id)
-                    if order_result["success"]:
-                        state = (order_result["result"] or {}).get("order_state", "")
-                        if state == "filled":
-                            is_filled = True
-                        elif state == "open":
-                            # 交易所说还在，但 get_open_orders 没返回——可能是 API 延迟，跳过本轮
-                            self._log_info("%s order %s missing from open list but state=open, skipping", side_key, our_id)
-                            continue
-                        elif state == "cancelled":
-                            # 明确取消了
-                            pass
-                    # 如果 success=False 或 result 为空 → 订单已不存在，视为取消
+                    default_price = sell_price if side_key == "sell" else buy_price
+                    state = self._reconcile_missing_order(
+                        side_key, our_id, default_price,
+                    )
+                    if state == "open":
+                        # 交易所说还在，但 get_open_orders 没返回——可能是 API 延迟，跳过本轮
+                        self._log_info(
+                            "%s order %s missing from open list but state=open, skipping",
+                            side_key, our_id,
+                        )
+                        continue
                 except Exception as e:
                     self._log_info("%s order %s get_order_state failed: %s", side_key, our_id, e)
                     # API 失败时回退：不处理，留到下一轮再说
                     continue
 
-                if not is_filled:
-                    self._log_info("%s order %s was cancelled/removed (not filled)", side_key, our_id)
-                    setattr(self, our_id_attr, None)
-                    continue
-
-                self._log_info("%s maker order %s was filled!", side_key, our_id)
+                if state != "filled":
+                    self._log_info(
+                        "%s order %s was cancelled/removed (%s)",
+                        side_key, our_id, state or "unknown",
+                    )
                 setattr(self, our_id_attr, None)
-                # 触发冷静期
-                self._cooldown_until = time.time() + self.cfg.get("cooldown_seconds", 180)
-                self._log_info("Cooldown activated: %ds", self.cfg.get("cooldown_seconds", 180))
-                # 从交易所拉实际成交价（比阈值价更准确）
-                fill_price = sell_price if side_key == "sell" else buy_price  # 默认值
-                trade_amount = self.cfg["trade_size_usdc"] / fill_price
-                try:
-                    order_result = self.api.get_order_state(our_id)
-                    if order_result["success"]:
-                        parsed = self.api.parse_order_result(order_result["result"] or {})
-                        if parsed["average_price"] > 0:
-                            fill_price = parsed["average_price"]
-                            trade_amount = parsed["filled_amount"]
-                            self._log_info("Actual fill: %.6f BTC @ %.2f", trade_amount, fill_price)
-                except Exception:
-                    pass
-                self.anchor_price = fill_price
-                # 成交后立刻重算 RV，新挂单直接用最新波动率
-                self._update_rv()
-                self._recalc_thresholds()
-                self._fetch_balances()
-                # 记录成交 + 增量维护库存与已实现盈亏
-                with self._lock:
-                    if side_key == "buy":
-                        self.buy_inventory.append([round(trade_amount, 6), fill_price])
-                    else:
-                        # 卖出：FIFO 配对买入库存，实现盈亏
-                        remaining = trade_amount
-                        while remaining > 1e-6 and self.buy_inventory:
-                            lot = self.buy_inventory[0]
-                            take = min(lot[0], remaining)
-                            self.realized_pnl += take * (fill_price - lot[1])
-                            lot[0] -= take
-                            remaining -= take
-                            if lot[0] <= 1e-6:
-                                self.buy_inventory.pop(0)
-                        if remaining > 1e-6:
-                            self._log_info("Sell %.6f exceeds buy inventory, partial PNL skipped", remaining)
-                    self.trades.append({
-                        "id": f"{'B' if side_key == 'buy' else 'S'}{int(time.time())}",
-                        "time": datetime.now(BJT).isoformat(),
-                        "side": side_key,
-                        "amount_btc": round(trade_amount, 6),
-                        "price": fill_price,
-                        "total_usdc": round(trade_amount * fill_price, 2),
-                        "order_id": our_id,
-                        "status": "filled",
-                        "label": "maker",
-                    })
-                    self.total_trades += 1
-                    # 内存 trades 上限（PNL 已增量维护，历史仅展示用）
-                    if len(self.trades) > 500:
-                        self.trades = self.trades[-500:]
-                self._save_state()
-                # 取消对侧挂单（价位已经变了）
-                other_id = self._our_buy_id if side_key == "sell" else self._our_sell_id
-                if other_id:
-                    r = self.api.cancel_order(other_id)
-                    if not r["success"]:
-                        self._route_api_error(
-                            "cancel", r, "buy" if side_key == "sell" else "sell"
-                        )
-                    setattr(self, "_our_buy_id" if side_key == "sell" else "_our_sell_id", None)
-                # --- 方案A（后继）：成交后检查新锚点是否偏离当前指数价，偏离则继续追 ---
-                idx = self.btc_index_price
-                if idx > 0:
-                    deviation = abs(idx / self.anchor_price - 1)
-                    if deviation > self.daily_rv:
-                        old_anchor = self.anchor_price
-                        self.anchor_price = idx
-                        self._update_rv()
-                        self._recalc_thresholds()
-                        self._log_info("方案A: Anchor追 %.2f -> %.2f (deviation %.4f%%), RV=%.2f%%",
-                                       old_anchor, idx, deviation * 100, self.daily_rv * 100)
-                        self._cooldown_until = time.time() + self.cfg.get("cooldown_seconds", 180)
-                        self._log_info("方案A: Cooldown %ds", self.cfg.get("cooldown_seconds", 180))
-                        # 对侧挂单已在成交处理中取消，此处无需重复 cancel
-                        buy_price = self._round_price(self.lower_threshold)
-                        sell_price = self._round_price(self.upper_threshold)
 
         # --- 取消价位不对的挂单 ---
         for o in self.open_orders:
@@ -1004,7 +1203,7 @@ class StrategyEngine:
             for o in self.open_orders
         )
         if not self._our_buy_id and not buy_exists and buy_amount > 0 and not self.usdc_insufficient:
-            if buy_amount * buy_price <= self.usdc_balance:
+            if buy_amount * buy_price <= self.usdc_available:
                 self._log_info("Placing buy maker @ %.2f for %.6f BTC", buy_price, buy_amount)
                 result = self.api.buy(
                     self.cfg["instrument_name"], amount=buy_amount,
@@ -1019,7 +1218,7 @@ class StrategyEngine:
                     self._route_api_error("buy", result, "buy")
             else:
                 self._log_info("Buy skipped: USDC insufficient (need %.2f have %.2f)",
-                               buy_amount * buy_price, self.usdc_balance)
+                               buy_amount * buy_price, self.usdc_available)
         elif self._our_buy_id:
             # 防刷屏：不成交时每 10 轮才打一次常规消息
             if not hasattr(self, '_buy_skip_counter'):
@@ -1041,7 +1240,7 @@ class StrategyEngine:
             for o in self.open_orders
         )
         if not self._our_sell_id and not sell_exists and sell_amount > 0 and not self.btc_insufficient:
-            if sell_amount <= self.btc_balance:
+            if sell_amount <= self.btc_available:
                 self._log_info("Placing sell maker @ %.2f for %.6f BTC", sell_price, sell_amount)
                 result = self.api.sell(
                     self.cfg["instrument_name"], amount=sell_amount,
@@ -1056,7 +1255,7 @@ class StrategyEngine:
                     self._route_api_error("sell", result, "sell")
             else:
                 self._log_info("Sell skipped: BTC insufficient (need %.6f have %.6f)",
-                               sell_amount, self.btc_balance)
+                               sell_amount, self.btc_available)
         elif self._our_sell_id:
             if not hasattr(self, '_sell_skip_counter'):
                 self._sell_skip_counter = 0

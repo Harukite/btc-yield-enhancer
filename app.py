@@ -300,6 +300,12 @@ def api_init():
         if engine.status == "ready":
             break
         pytime.sleep(0.5)
+    if engine.status != "ready":
+        return jsonify({
+            "success": False,
+            "message": "Initialization failed",
+            "status": engine.status,
+        }), 500
     return jsonify({"success": True, "message": "Engine initialized", "status": engine.status})
 
 
@@ -523,13 +529,23 @@ def api_test_connection():
                 quote_currency = OKX_INSTRUMENT_NAME.replace("_", "-").split("-")[1]
                 quote = client.get_account_summary(currency=quote_currency)
                 if quote:
-                    info["usdc_balance"] = quote.get("balance", 0)
+                    info["usdc_balance"] = quote.get(
+                        "equity", quote.get("total_balance", quote.get("balance", 0))
+                    )
+                    info["usdc_available"] = quote.get(
+                        "available", quote.get("balance", info["usdc_balance"])
+                    )
             except Exception:
                 pass
             try:
                 btc = client.get_account_summary(currency="BTC")
                 if btc:
-                    info["btc_balance"] = btc.get("balance", 0)
+                    info["btc_balance"] = btc.get(
+                        "equity", btc.get("total_balance", btc.get("balance", 0))
+                    )
+                    info["btc_available"] = btc.get(
+                        "available", btc.get("balance", info["btc_balance"])
+                    )
             except Exception:
                 pass
         results[label] = info
