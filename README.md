@@ -248,7 +248,6 @@ OKX_INSTRUMENT_NAME=BTC-USDC
 DATA_DIR=/data
 API_TOKEN=replace_with_a_long_random_value
 OKX_REST_BASE_URL=https://openapi.okx.com
-NIXPACKS_INSTALL_CMD=pip install -r requirements.txt gunicorn
 NIXPACKS_START_CMD=gunicorn --bind 0.0.0.0:5050 --workers 1 --threads 8 --timeout 120 app:app
 ```
 
