@@ -29,6 +29,22 @@
   function clsVal(n) { if (!n || n === 0) return ""; return n > 0 ? "up" : "down"; }
   function setDot(el, cls) { var d = $(el); if (d) d.className = "dot " + cls; }
 
+  function formatOrderTime(value) {
+    if (value == null || value === "") return "";
+    var text = String(value).trim();
+    var date;
+    if (/^\d+(?:\.\d+)?$/.test(text)) {
+      var timestamp = Number(text);
+      if (!Number.isFinite(timestamp)) return "-";
+      // OKX cTime is milliseconds; also accept second timestamps for old data.
+      if (timestamp < 100000000000) timestamp *= 1000;
+      date = new Date(timestamp);
+    } else {
+      date = new Date(value);
+    }
+    return Number.isNaN(date.getTime()) ? "-" : date.toLocaleString("zh-CN", { hour12: false });
+  }
+
   // ---- K 线图 ----
   function createChart() {
     if (chart) return;
@@ -233,7 +249,7 @@
     noData.style.display = "none";
     if (count) count.textContent = "(" + orders.length + " 笔)";
     body.innerHTML = orders.map(function (o) {
-      var t = o.time ? new Date(o.time).toLocaleString("zh-CN", {hour12:false}) : "";
+      var t = formatOrderTime(o.time);
       var sideTag = '<span class="tag ' + o.side + '">' + (o.side === "buy" ? "买入" : "卖出") + "</span>";
       var stateLabel = ({open:"挂单中",filled:"已成交",cancelled:"已取消",rejected:"已拒绝"})[o.state] || o.state;
       return "<tr><td>" + t + "</td><td>" + sideTag + "</td><td>" + o.amount.toFixed(6) + "</td><td>" + o.filled.toFixed(6) + "</td><td>" + o.remaining.toFixed(6) + "</td><td>$" + (o.price || 0).toFixed(2) + "</td><td>" + stateLabel + "</td></tr>";
