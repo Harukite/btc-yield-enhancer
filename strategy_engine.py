@@ -65,10 +65,10 @@ class StrategyEngine:
         self._running = False
         self._lock = threading.Lock()
 
-        # 合约规格
-        self.contract_size = 0.0001
-        self.min_trade_amount = 0.0001
-        self.tick_size = 1.0
+        # 合约规格（路由 CBE 后：tick 1.0→0.01、min qty/contract 1e-4→1e-8；运行时 _fetch_instrument_info 会覆盖）
+        self.contract_size = 1e-8
+        self.min_trade_amount = 1e-8
+        self.tick_size = 0.01
 
         # 策略状态
         self.status = "stopped"
@@ -232,8 +232,8 @@ class StrategyEngine:
                     self.contract_size = float(inst.get("contract_size", 0.0001))
                     self.min_trade_amount = float(inst.get("min_trade_amount", 0.0001))
                     self.tick_size = float(inst.get("tick_size", 1.0))
-                    logger.info("Instrument: contract=%.4f min_trade=%.4f",
-                                self.contract_size, self.min_trade_amount)
+                    logger.info("Instrument: contract=%g min_trade=%g tick=%g",
+                                self.contract_size, self.min_trade_amount, self.tick_size)
                     return True
         except Exception as e:
             logger.error("Fetch instrument error: %s", e)
@@ -476,10 +476,10 @@ class StrategyEngine:
         if bal is None:
             return False
 
-        # 3. 获取指数价
-        price = self.api.get_index_price(self.cfg["index_name"])
+        # 3. 获取现货参考价（路由 CBE 后，用盘口 bid/ask 中值 mid，而非 Deribit 指数价）
+        price = self._fetch_spot_price()
         if not price or price <= 0:
-            logger.error("Cannot get index price")
+            logger.error("Cannot get spot price")
             return False
         self.btc_index_price = price
 
@@ -579,10 +579,11 @@ class StrategyEngine:
             logger.info("RV: %.2f%% → %.2f%%", old * 100, rv * 100)
 
     def _calculate_daily_rv(self):
-        """用主网 BTC_USDC 现货 5 分钟 K 线，取 12 根(1小时窗口)的 RMS × √24 作为日化 RV"""
+        """用主网 BTC-PERPETUAL 现货 5 分钟 K 线，取 12 根(1小时窗口)的 RMS × √24 作为日化 RV。
+        路由 CBE 后 BTC_USDC 的 get_tradingview_chart_data 返回 11060 不可用，改用永续 K 线(与现货波动率一致)。"""
         end = int(time.time() * 1000)
         start = end - 3 * 3600 * 1000  # 拉3小时确保有12根
-        data = self._fetch_public_kline("BTC_USDC", start, end, "5")
+        data = self._fetch_public_kline("BTC-PERPETUAL", start, end, "5")
         if not data or not data.get("close") or not data.get("open"):
             return self._fallback_rv()
 
@@ -667,13 +668,16 @@ class StrategyEngine:
                     if self.btc_index_price > 0:
                         self.btc_value_usdc = self.btc_balance * self.btc_index_price
                         self.total_value_usdc = self.usdc_balance + self.btc_value_usdc
-            elif "index" in channel:
-                idx = data.get("index_price") or data.get("idx")
-                if idx is not None and float(idx) > 0:
+            elif channel.startswith("ticker."):
+                # 路由 CBE 后：现货价用盘口 bid/ask 中值(mid)，贴近真实可成交价
+                bid = float(data.get("best_bid_price", 0) or 0)
+                ask = float(data.get("best_ask_price", 0) or 0)
+                mid = (bid + ask) / 2 if (bid > 0 and ask > 0) else float(data.get("last_price", 0) or 0)
+                if mid > 0:
                     old = self.btc_index_price
-                    self.btc_index_price = float(idx)
-                    if abs(self.btc_index_price - old) > 0.1:
-                        logger.info("WS[index]: %.2f -> %.2f", old, self.btc_index_price)
+                    self.btc_index_price = mid
+                    if abs(self.btc_index_price - old) > 0.5:  # 100ms 推送，阈值放大防刷屏
+                        logger.info("WS[spot]: %.2f -> %.2f", old, self.btc_index_price)
                     self._last_ws_index_update = time.time()
                     self._recalc_values()
                     self.api_connected = True
@@ -697,8 +701,26 @@ class StrategyEngine:
     _BALANCE_REST_INTERVAL = 30  # 余额 REST 备用拉取间隔（秒，WS 静默断流时回退）
     _last_index_rest_ts = 0.0
 
+    def _fetch_spot_price(self):
+        """拉现货参考价：ticker 的盘口 bid/ask 中值(mid)。
+        路由 CBE 后，Deribit 指数价(mark)比真实可成交价高约 14 美元，
+        交易决策必须用现货成交价而非指数价。"""
+        try:
+            t = self.api.get_ticker(self.cfg["instrument_name"])
+            if not t:
+                return None
+            bid = float(t.get("best_bid_price", 0) or 0)
+            ask = float(t.get("best_ask_price", 0) or 0)
+            if bid > 0 and ask > 0:
+                return (bid + ask) / 2
+            last = float(t.get("last_price", 0) or 0)
+            return last if last > 0 else None
+        except Exception as e:
+            logger.warning("Fetch spot price failed: %s", e)
+            return None
+
     def _update_index_price(self):
-        """获取指数价：优先 WS 实时数据，WS 过期时 fallback REST"""
+        """获取现货参考价：优先 WS 实时盘口 mid，WS 过期时 fallback REST ticker"""
         now = time.time()
         # WS 有数据且在 30 秒内更新过，直接用
         if self._ws_enabled and self.btc_index_price > 0 and (now - self._last_ws_index_update) < 30:
@@ -708,7 +730,7 @@ class StrategyEngine:
             return
         self._last_index_rest_ts = now
         try:
-            price = self.api.get_index_price(self.cfg["index_name"])
+            price = self._fetch_spot_price()
         except Exception:
             price = None
         if price and price > 0:
@@ -834,7 +856,7 @@ class StrategyEngine:
             side = o.get("side")
             price = o.get("price")
             if side and price is not None:
-                orders_by_price.setdefault(side, {})[round(price)] = o.get("order_id")
+                orders_by_price.setdefault(side, {})[self._round_price(price)] = o.get("order_id")
 
         # --- 防重复兜底：交易所已有同价位的挂单，但我们没追踪 → 认领回来 ---
         for side, our_attr, target_price in [

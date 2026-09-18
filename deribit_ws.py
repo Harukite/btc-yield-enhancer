@@ -86,10 +86,12 @@ class DeribitWSClient:
         self._max_reconnect_delay = 60.0
 
         # 订阅频道
+        # 路由 CBE 后：价格用 ticker.100ms 的盘口 bid/ask 算 mid（贴近可成交价），
+        # 不再用 ticker.BTC_USDC.index（指数价/mark 比真实成交价高约 14 美元）
         self._channels = [
             "user.portfolio.btc",
             "user.portfolio.usdc",
-            "ticker.BTC_USDC.index",
+            "ticker.BTC_USDC.100ms",
         ]
 
     # ------------------------------------------------------------------
@@ -335,11 +337,14 @@ class DeribitWSClient:
             bal = _f(data.get("balance"))
             if bal >= 0:
                 self.cached_usdc_balance = bal
-        elif "index" in channel:
-            # Deribit index ticker 可能用 index_price 或 idx 字段
-            idx = _f(data.get("index_price")) or _f(data.get("idx"))
-            if idx > 0:
-                self.cached_index_price = idx
+        elif channel.startswith("ticker."):
+            # 路由 CBE 后：现货价用盘口 bid/ask 中值(mid)，比 last 平滑、比指数价贴近可成交
+            bid = _f(data.get("best_bid_price"))
+            ask = _f(data.get("best_ask_price"))
+            if bid > 0 and ask > 0:
+                self.cached_index_price = (bid + ask) / 2
+            elif _f(data.get("last_price")) > 0:
+                self.cached_index_price = _f(data.get("last_price"))
 
     def _handle_rpc_response(self, msg: dict):
         error = msg.get("error")

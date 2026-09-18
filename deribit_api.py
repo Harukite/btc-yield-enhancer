@@ -441,6 +441,9 @@ class DeribitClient:
             params["reduce_only"] = True
         if post_only:
             params["post_only"] = True
+            # 路由现货(Coinbase CBE)的 post_only 必须带 reject_post_only=true，
+            # 否则被拒 post_only_not_allowed(11055)；价格永不调整，cross 则拒(11054)
+            params["reject_post_only"] = True
         return self._call("private/buy", params, need_auth=True)
 
     def sell(
@@ -467,6 +470,9 @@ class DeribitClient:
             params["reduce_only"] = True
         if post_only:
             params["post_only"] = True
+            # 路由现货(Coinbase CBE)的 post_only 必须带 reject_post_only=true，
+            # 否则被拒 post_only_not_allowed(11055)
+            params["reject_post_only"] = True
         return self._call("private/sell", params, need_auth=True)
 
     def get_order_state(self, order_id: str) -> dict:
