@@ -445,7 +445,8 @@ def api_params():
 
 @app.route("/btc-enhancer/api/kline")
 def api_kline():
-    """拉主网 BTC_USDC 现货 K 线（公共 API，无需鉴权，不受 testnet 开关影响）"""
+    """拉主网 BTC-PERPETUAL K 线（公共 API，无需鉴权，不受 testnet 开关影响）。
+    路由 CBE 后 BTC_USDC 现货的 get_tradingview_chart_data 返回 11060 不可用，改用永续 K 线。"""
     try:
         import requests as _requests
         end = int(pytime.time() * 1000)
@@ -454,7 +455,7 @@ def api_kline():
             "jsonrpc": "2.0", "id": 1,
             "method": "public/get_tradingview_chart_data",
             "params": {
-                "instrument_name": "BTC_USDC",
+                "instrument_name": "BTC-PERPETUAL",
                 "start_timestamp": start,
                 "end_timestamp": end,
                 "resolution": "5",
